@@ -1,0 +1,9 @@
+{
+	"RemapUnityFiles": 
+	{
+		"Module.Kinemotion.cpp.obj": [
+			"PerModuleInline.gen.cpp.obj",
+			"Kinemotion.cpp.obj"
+		]
+	}
+}

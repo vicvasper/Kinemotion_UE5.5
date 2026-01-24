@@ -1,0 +1,13 @@
+/NOLOGO
+/errorReport:prompt
+/MACHINE:x64
+/SUBSYSTEM:WINDOWS
+/DEF
+/NAME:"UnrealEditor-Kinemotion.dll"
+/IGNORE:4221
+/NODEFAULTLIB
+"E:\Proyectos\ProyectosUnreal\KinemotionPlugin\Intermediate\Build\Win64\x64\KinemotionPluginEditor\Development\UnrealEd\SharedPCH.UnrealEd.Cpp20.h.obj"
+"E:\Proyectos\ProyectosUnreal\KinemotionPlugin\Plugins\Kinemotion\Intermediate\Build\Win64\x64\UnrealEditor\Development\Kinemotion\Module.Kinemotion.cpp.obj"
+"E:\Proyectos\ProyectosUnreal\KinemotionPlugin\Plugins\Kinemotion\Intermediate\Build\Win64\x64\UnrealEditor\Development\Kinemotion\Kinemotion.cpp.obj"
+"E:\Proyectos\ProyectosUnreal\KinemotionPlugin\Plugins\Kinemotion\Intermediate\Build\Win64\x64\UnrealEditor\Development\Kinemotion\Default.rc2.res"
+/OUT:"E:\Proyectos\ProyectosUnreal\KinemotionPlugin\Plugins\Kinemotion\Intermediate\Build\Win64\x64\UnrealEditor\Development\Kinemotion\UnrealEditor-Kinemotion.lib"

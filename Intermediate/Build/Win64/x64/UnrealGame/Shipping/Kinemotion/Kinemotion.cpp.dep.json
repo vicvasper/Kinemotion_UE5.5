@@ -1,0 +1,14 @@
+{
+    "Version": "1.2",
+    "Data": {
+        "Source": "e:\\proyectos\\proyectosunreal\\kinemotionplugin\\plugins\\kinemotion\\source\\kinemotion\\private\\kinemotion.cpp",
+        "ProvidedModule": "",
+        "PCH": "e:\\proyectos\\proyectosunreal\\kinemotionplugin\\intermediate\\build\\win64\\x64\\kinemotionplugin\\shipping\\engine\\sharedpch.engine.project.valapi.cpp20.h.pch",
+        "Includes": [
+            "e:\\proyectos\\proyectosunreal\\kinemotionplugin\\plugins\\kinemotion\\intermediate\\build\\win64\\x64\\unrealgame\\shipping\\kinemotion\\definitions.kinemotion.h",
+            "e:\\proyectos\\proyectosunreal\\kinemotionplugin\\plugins\\kinemotion\\source\\kinemotion\\public\\kinemotion.h"
+        ],
+        "ImportedModules": [],
+        "ImportedHeaderUnits": []
+    }
+}
