@@ -6,7 +6,6 @@ https://github.com/user-attachments/assets/afc76e2f-0b01-4427-8085-b326c03b9bd0
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.x-blue.svg)](https://www.unrealengine.com/)
 [![Module](https://img.shields.io/badge/Plugin-Runtime-informational.svg)](#architecture)
 [![Version](https://img.shields.io/badge/Version-1.0-orange.svg)](https://github.com/vicvasper/Kinemotion_UE5.5-/releases)
-[![License](https://img.shields.io/badge/License-TBD-lightgrey.svg)](#license)
 
 Monocular AI motion capture for Unreal Engine 5.x. Kinemotion ingests webcam video, runs inference with Unreal’s Neural Network Engine (NNE), and streams a 19-bone skeleton through Live Link for retargeting to any `USkeletalMeshComponent` in editor or PIE.
 
