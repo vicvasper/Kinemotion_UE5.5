@@ -1,223 +1,381 @@
-﻿#include "KinemotionMocap.h"
+// Copyright (c) Victor Rivas Perez. All Rights Reserved.
+
+#include "KinemotionMocap.h"
+
+#include "Async/Async.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/SkeletalMesh.h"
+#include "Engine/World.h"
+#include "Features/IModularFeatures.h"
+#include "ILiveLinkClient.h"
+#include "Kinemotion.h"
+#include "KinemotionTypes.h"
+#include "MediaPlayer.h"
+#include "MediaTexture.h"
 #include "Misc/MediaBlueprintFunctionLibrary.h"
-#include "Rendering/Texture2DResource.h"
+#include "Misc/Timecode.h"
+#include "NNEModelData.h"
+#include "RHI.h"
+#include "RHICommandList.h"
+#include "RenderingThread.h"
+#include "SceneTypes.h"
 #include "Roles/LiveLinkAnimationRole.h"
 #include "Roles/LiveLinkAnimationTypes.h"
-#include "Kismet/KismetRenderingLibrary.h"
-#include "Async/Async.h"
-#include "Misc/Timecode.h"
-#include "NNEModelData.h" 
-#include "Features/IModularFeatures.h" // Obligatorio para el Cliente Directo
+#include "TimerManager.h"
 
-// Función auxiliar para crear rotación desde dirección (Forward-X) y UpVector (Z)
-static FQuat MakeQuatFromDirection(const FVector& Dir, const FVector& UpVector = FVector::UpVector)
+namespace
 {
-	const FVector Forward = Dir.GetSafeNormal();
-	const FVector Right = FVector::CrossProduct(UpVector, Forward).GetSafeNormal();
-	const FVector RecomputedUp = FVector::CrossProduct(Forward, Right).GetSafeNormal();
+	/**
+	 * The rig published to Live Link.
+	 *
+	 * Bone names, the parent hierarchy and the mapping from tracked points onto bones used to
+	 * be three separate hand-maintained lists - two arrays in the static-data setup and a run
+	 * of per-bone calls in the frame path. Any edit had to be mirrored in all three, in
+	 * matching index order, with nothing to catch a mismatch. They are one table now.
+	 *
+	 * ReferencePoint is the point each bone's translation is expressed relative to, which is
+	 * not always its parent bone's driving point.
+	 */
+	struct FKinemotionBoneDef
+	{
+		const TCHAR* Name;
+		int32 ParentBoneIndex;
+		EKinemotionPoint Point;
+		EKinemotionPoint ReferencePoint;
+	};
 
-	FMatrix Mat = FMatrix(
-		Forward,
-		Right,
-		RecomputedUp,
-		FVector::ZeroVector
-	);
+	constexpr FKinemotionBoneDef KinemotionRig[] =
+	{
+		{ TEXT("root"),       -1, EKinemotionPoint::HipCenter,     EKinemotionPoint::HipCenter     },
+		{ TEXT("pelvis"),      0, EKinemotionPoint::HipCenter,     EKinemotionPoint::HipCenter     },
+		{ TEXT("spine_01"),    1, EKinemotionPoint::SpineMid,      EKinemotionPoint::HipCenter     },
+		{ TEXT("neck_01"),     2, EKinemotionPoint::NeckBase,      EKinemotionPoint::SpineMid      },
+		{ TEXT("head"),        3, EKinemotionPoint::Nose,          EKinemotionPoint::NeckBase      },
 
-	return FQuat(Mat);
+		{ TEXT("clavicle_l"),  3, EKinemotionPoint::LeftClavicle,  EKinemotionPoint::NeckBase      },
+		{ TEXT("upperarm_l"),  5, EKinemotionPoint::LeftShoulder,  EKinemotionPoint::LeftClavicle  },
+		{ TEXT("lowerarm_l"),  6, EKinemotionPoint::LeftElbow,     EKinemotionPoint::LeftShoulder  },
+		{ TEXT("hand_l"),      7, EKinemotionPoint::LeftWrist,     EKinemotionPoint::LeftElbow     },
+
+		{ TEXT("clavicle_r"),  3, EKinemotionPoint::RightClavicle, EKinemotionPoint::NeckBase      },
+		{ TEXT("upperarm_r"),  9, EKinemotionPoint::RightShoulder, EKinemotionPoint::RightClavicle },
+		{ TEXT("lowerarm_r"), 10, EKinemotionPoint::RightElbow,    EKinemotionPoint::RightShoulder },
+		{ TEXT("hand_r"),     11, EKinemotionPoint::RightWrist,    EKinemotionPoint::RightElbow    },
+
+		{ TEXT("thigh_l"),     1, EKinemotionPoint::LeftHip,       EKinemotionPoint::HipCenter     },
+		{ TEXT("calf_l"),     13, EKinemotionPoint::LeftKnee,      EKinemotionPoint::LeftHip       },
+		{ TEXT("foot_l"),     14, EKinemotionPoint::LeftAnkle,     EKinemotionPoint::LeftKnee      },
+
+		{ TEXT("thigh_r"),     1, EKinemotionPoint::RightHip,      EKinemotionPoint::HipCenter     },
+		{ TEXT("calf_r"),     16, EKinemotionPoint::RightKnee,     EKinemotionPoint::RightHip      },
+		{ TEXT("foot_r"),     17, EKinemotionPoint::RightAnkle,    EKinemotionPoint::RightKnee     },
+	};
+
+	constexpr int32 KinemotionBoneCount = UE_ARRAY_COUNT(KinemotionRig);
+
+	/** Root and pelvis are anchored rather than driven point-to-point, so they are handled apart. */
+	constexpr int32 RootBoneIndex = 0;
+	constexpr int32 PelvisBoneIndex = 1;
+	constexpr int32 FirstDrivenBoneIndex = 2;
+
+	/** Which model keypoint feeds each directly-tracked point. Derived points are absent. */
+	struct FKinemotionKeypointMapping
+	{
+		EKinemotionPoint Point;
+		int32 ModelIndex;
+	};
+
+	constexpr FKinemotionKeypointMapping KinemotionDecodedPoints[] =
+	{
+		{ EKinemotionPoint::Nose,           KinemotionKeypoint::Nose          },
+		{ EKinemotionPoint::LeftShoulder,   KinemotionKeypoint::LeftShoulder  },
+		{ EKinemotionPoint::RightShoulder,  KinemotionKeypoint::RightShoulder },
+		{ EKinemotionPoint::LeftElbow,      KinemotionKeypoint::LeftElbow     },
+		{ EKinemotionPoint::RightElbow,     KinemotionKeypoint::RightElbow    },
+		{ EKinemotionPoint::LeftWrist,      KinemotionKeypoint::LeftWrist     },
+		{ EKinemotionPoint::RightWrist,     KinemotionKeypoint::RightWrist    },
+		{ EKinemotionPoint::LeftHip,        KinemotionKeypoint::LeftHip       },
+		{ EKinemotionPoint::RightHip,       KinemotionKeypoint::RightHip      },
+		{ EKinemotionPoint::LeftKnee,       KinemotionKeypoint::LeftKnee      },
+		{ EKinemotionPoint::RightKnee,      KinemotionKeypoint::RightKnee     },
+		{ EKinemotionPoint::LeftAnkle,      KinemotionKeypoint::LeftAnkle     },
+		{ EKinemotionPoint::RightAnkle,     KinemotionKeypoint::RightAnkle    },
+	};
+
+	// -- Class defaults -------------------------------------------------------------------
+
+	const TCHAR* const DefaultSubjectName = TEXT("KinemotionWebcam");
+	const TCHAR* const DefaultPoseModelPath = TEXT("/Kinemotion/NeuralNetworks/pose_landmark_full.pose_landmark_full");
+	const FName DefaultNneRuntimeName(TEXT("NNERuntimeORTDml"));
+
+	constexpr float DefaultStickmanScale = 1.0f;
+	constexpr float DefaultReferenceSizeCM = 170.0f;
+	constexpr float DefaultClavicleBlend = 0.3f;
+	constexpr float DefaultYawCorrectionDegrees = 90.0f;
+	constexpr int32 DefaultLiveLinkFrameRate = 60;
+
+	constexpr float DefaultSmoothingAlpha = 0.3f;
+	constexpr float DefaultDeadzoneCM = 0.5f;
+	constexpr float DefaultMaxStepCM = 15.0f;
+
+	constexpr float DefaultDebugPointRadius = 5.0f;
+	constexpr float DefaultDebugBoneThickness = 2.0f;
+
+	/** Just over one frame at 60 Hz: long enough to stay visible, short enough not to pile up. */
+	constexpr float DefaultDebugDrawLifetime = 0.05f;
+
+	// -- Implementation constants ---------------------------------------------------------
+
+	/** Below this the smoothing filter is a no-op, so it is bypassed rather than run. */
+	constexpr float MinEffectiveSmoothingAlpha = 0.01f;
+
+	/** Midpoint weight for deriving centre points from a symmetric pair. */
+	constexpr float SymmetricPairMidpoint = 0.5f;
+
+	/** Passed to the capture-device enumerator to request every device, unfiltered. */
+	constexpr int32 AllCaptureDeviceFilter = -1;
+
+	/** Segments used for debug spheres. Low: these are diagnostics, drawn once per point per frame. */
+	constexpr int32 DebugSphereSegments = 8;
+
+	/** Bounded so a mesh that never populates its transforms cannot retry forever. */
+	constexpr int32 MaxCalibrationAttempts = 30;
+
+	const FName PelvisBoneName(TEXT("pelvis"));
+	const FName NeckBoneName(TEXT("neck_01"));
+
+	/**
+	 * Decodes one SimCC axis into a normalised [0, 1] coordinate.
+	 *
+	 * The model classifies each axis into BinCount bins rather than regressing a coordinate,
+	 * so the prediction is the index of the highest-scoring bin, normalised by the bin count.
+	 */
+	float DecodeSimccAxis(const float* Buffer, int32 BinCount)
+	{
+		checkSlow(Buffer != nullptr && BinCount > 0);
+
+		float BestScore = -FLT_MAX;
+		int32 BestBin = 0;
+
+		for (int32 Bin = 0; Bin < BinCount; ++Bin)
+		{
+			if (Buffer[Bin] > BestScore)
+			{
+				BestScore = Buffer[Bin];
+				BestBin = Bin;
+			}
+		}
+
+		return static_cast<float>(BestBin) / static_cast<float>(BinCount);
+	}
 }
 
 UKinemotionMocap::UKinemotionMocap()
+	: SubjectName(DefaultSubjectName)
+	, CameraIndex(0)
+	, PoseModel(FSoftObjectPath(DefaultPoseModelPath))
+	, NneRuntimeName(DefaultNneRuntimeName)
+	, StickmanScale(DefaultStickmanScale)
+	, bScaleRelativeToSkeleton(true)
+	, ReferenceSizeCM(DefaultReferenceSizeCM)
+	, bAutoCalibrate(true)
+	, bUseFloorAsRoot(true)
+	, bPelvisFree(false)
+	, FloorZOffset(0.0f)
+	, ClavicleBlend(DefaultClavicleBlend)
+	, YawCorrectionDegrees(DefaultYawCorrectionDegrees)
+	, LiveLinkFrameRate(DefaultLiveLinkFrameRate)
+	, bEnableSmoothing(true)
+	, SmoothingAlpha(DefaultSmoothingAlpha)
+	, DeadzoneCM(DefaultDeadzoneCM)
+	, MaxStepCM(DefaultMaxStepCM)
+	, bShowDebug(false)
+	, DebugPointRadius(DefaultDebugPointRadius)
+	, DebugBoneThickness(DefaultDebugBoneThickness)
+	, DebugDrawLifetime(DefaultDebugDrawLifetime)
 {
 	PrimaryComponentTick.bCanEverTick = true;
+
+	PoseLocal.SetNumZeroed(KinemotionPointCount);
+	PrevFilteredLocal.SetNumZeroed(KinemotionPointCount);
+	bHasFilteredSample.Init(false, KinemotionPointCount);
 }
 
 void UKinemotionMocap::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 1. Configurar Live Link Directo (Prioritario)
 	SetupLiveLinkDirect();
-
-	// 2. Cargar IA
 	InitNNE();
 
-	// 3. **CALIBRAR SKELETON** ⭐
 	if (bAutoCalibrate)
 	{
 		CalibrateFromSkeleton();
 	}
-	// 3. Abrir Cámara
+
 	InitMedia();
 }
 
 void UKinemotionMocap::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// Resetear estado de pelvis
 	bPelvisInitialized = false;
 	InitialPelvisWorld = FVector::ZeroVector;
-	if (MediaPlayer) MediaPlayer->Close();
 
-	// Limpiar sujeto de Live Link para no dejar "fantasmas"
-	if (bLiveLinkRegistered && IModularFeatures::Get().IsModularFeatureAvailable(ILiveLinkClient::ModularFeatureName))
+	if (MediaPlayer)
 	{
-		ILiveLinkClient* LiveLinkClient = &IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
-		LiveLinkClient->RemoveSubject_AnyThread(SubjectKey);
+		MediaPlayer->Close();
 	}
 
+	ShutdownLiveLink();
+
+	// Released before the component goes away so no inference can be in flight against a
+	// model instance whose owner is being torn down.
 	ModelInstance.Reset();
+
 	Super::EndPlay(EndPlayReason);
 }
 
+void UKinemotionMocap::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+	// One read in flight at a time: the capture rate is bounded by inference, not by the tick.
+	if (!bIsReadingFrame.load(std::memory_order_acquire) && ModelInstance.IsValid() && MediaTexture)
+	{
+		RequestTextureRead();
+	}
+}
+
+// ---------------------------------------------------------------------------------------
+// Live Link
+// ---------------------------------------------------------------------------------------
+
 void UKinemotionMocap::SetupLiveLinkDirect()
 {
-	// Obtener la interfaz del cliente del motor
 	if (!IModularFeatures::Get().IsModularFeatureAvailable(ILiveLinkClient::ModularFeatureName))
 	{
-		UE_LOG(LogTemp, Error, TEXT("[Kinemotion] LiveLink Plugin is NOT enabled. Please enable it."));
+		UE_LOG(LogKinemotion, Error, TEXT("Live Link plugin is not enabled; capture cannot be published."));
 		return;
 	}
 
-	ILiveLinkClient* LiveLinkClient = &IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
+	ILiveLinkClient& LiveLinkClient =
+		IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
 
-	// CREAR Y REGISTRAR LA SOURCE PRIMERO (Esto hace que aparezca en la UI)
-	LiveLinkSource = MakeShared<FKinemotionLiveLinkSource>(
-		FText::FromString(TEXT("Kinemotion Mocap"))
-	);
+	// The source has to be registered before any subject data is pushed: without it the
+	// subject exists but has no entry in the Live Link panel, so it cannot be inspected or
+	// shut down from the UI. AddSource assigns the GUID and calls back into ReceiveClient.
+	LiveLinkSource = MakeShared<FKinemotionLiveLinkSource>(FText::FromString(TEXT("Kinemotion Mocap")));
+	SourceGuid = LiveLinkClient.AddSource(LiveLinkSource);
 
-	// AddSource asigna el GUID internamente y llama a ReceiveClient
-	SourceGuid = LiveLinkClient->AddSource(LiveLinkSource);
-
-	// Ahora crear el Subject Key con el GUID correcto de la Source
 	SubjectKey = FLiveLinkSubjectKey(SourceGuid, FName(*SubjectName));
 
-	// Definir Estructura Estática
 	FLiveLinkStaticDataStruct StaticData(FLiveLinkSkeletonStaticData::StaticStruct());
-	FLiveLinkSkeletonStaticData* SkelData = StaticData.Cast<FLiveLinkSkeletonStaticData>();
+	FLiveLinkSkeletonStaticData* SkeletonData = StaticData.Cast<FLiveLinkSkeletonStaticData>();
 
-	// --- LISTA DE HUESOS AMPLIADA ---
-	SkelData->BoneNames = {
-		TEXT("root"),           // 0
-		TEXT("pelvis"),         // 1
-		TEXT("spine_01"),       // 2  <-- NUEVO
-		TEXT("neck_01"),        // 3  <-- NUEVO
-		TEXT("head"),           // 4  (Antes era 2)
+	SkeletonData->BoneNames.Reserve(KinemotionBoneCount);
+	SkeletonData->BoneParents.Reserve(KinemotionBoneCount);
 
-		TEXT("clavicle_l"),     // 5  <-- NUEVO
-		TEXT("upperarm_l"),     // 6
-		TEXT("lowerarm_l"),     // 7
-		TEXT("hand_l"),         // 8
+	for (const FKinemotionBoneDef& Bone : KinemotionRig)
+	{
+		SkeletonData->BoneNames.Add(FName(Bone.Name));
+		SkeletonData->BoneParents.Add(Bone.ParentBoneIndex);
+	}
 
-		TEXT("clavicle_r"),     // 9  <-- NUEVO
-		TEXT("upperarm_r"),     // 10
-		TEXT("lowerarm_r"),     // 11
-		TEXT("hand_r"),         // 12
-
-		TEXT("thigh_l"),        // 13
-		TEXT("calf_l"),         // 14
-		TEXT("foot_l"),         // 15
-
-		TEXT("thigh_r"),        // 16
-		TEXT("calf_r"),         // 17
-		TEXT("foot_r")          // 18
-	};
-
-	// --- JERARQUÍA ACTUALIZADA ---
-	SkelData->BoneParents = {
-		-1, // 0 root
-		 0, // 1 pelvis
-		 1, // 2 spine_01   (Hijo de Pelvis)
-		 2, // 3 neck_01    (Hijo de Spine)
-		 3, // 4 head       (Hijo de Neck)
-
-		 3	, // 5 clavicle_l (Hijo de Neck/Spine superior)
-		 5, // 6 upperarm_l (Hijo de Clavicle)
-		 6, // 7 lowerarm_l
-		 7, // 8 hand_l
-
-		 3, // 9 clavicle_r (Hijo de Neck/Spine superior)
-		 9, // 10 upperarm_r
-		 10,// 11 lowerarm_r
-		 11,// 12 hand_r
-
-		 1, // 13 thigh_l   (Hijo de Pelvis)
-		 13,// 14 calf_l
-		 14,// 15 foot_l
-
-		 1, // 16 thigh_r   (Hijo de Pelvis)
-		 16,// 17 calf_r
-		 17 // 18 foot_r
-	};
-
-	// Inyectar directamente al motor
-	LiveLinkClient->PushSubjectStaticData_AnyThread(SubjectKey, ULiveLinkAnimationRole::StaticClass(), MoveTemp(StaticData));
+	LiveLinkClient.PushSubjectStaticData_AnyThread(
+		SubjectKey, ULiveLinkAnimationRole::StaticClass(), MoveTemp(StaticData));
 
 	bLiveLinkRegistered = true;
-	UE_LOG(LogTemp, Warning, TEXT("[Kinemotion] ✓ Live Link Source & Subject Registered: %s"), *SubjectName);
+
+	UE_LOG(LogKinemotion, Log, TEXT("Live Link source and subject registered as '%s' (%d bones)."),
+		*SubjectName, KinemotionBoneCount);
 }
 
-// 2. Inicializar IA (NNE) con Soporte GPU/CPU
-// --- KinemotionMocap.cpp ---
+void UKinemotionMocap::ShutdownLiveLink()
+{
+	if (!bLiveLinkRegistered)
+	{
+		return;
+	}
+
+	if (IModularFeatures::Get().IsModularFeatureAvailable(ILiveLinkClient::ModularFeatureName))
+	{
+		ILiveLinkClient& LiveLinkClient =
+			IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
+
+		LiveLinkClient.RemoveSubject_AnyThread(SubjectKey);
+
+		// Removing only the subject leaves the source behind as a dead entry in the Live Link
+		// panel, which accumulates across play sessions.
+		if (SourceGuid.IsValid())
+		{
+			LiveLinkClient.RemoveSource(SourceGuid);
+		}
+	}
+
+	LiveLinkSource.Reset();
+	SourceGuid.Invalidate();
+	bLiveLinkRegistered = false;
+}
+
+// ---------------------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::InitNNE()
 {
-    // 1. HARDCODE DE LA RUTA
-    // La ruta es: /NombrePlugin/RutaRelativa/NombreArchivo.NombreArchivo
-    const TCHAR* ModelPath = TEXT("/Kinemotion/NeuralNetworks/pose_landmark_full.pose_landmark_full");
+	ModelData = PoseModel.LoadSynchronous();
+	if (!ModelData)
+	{
+		UE_LOG(LogKinemotion, Error,
+			TEXT("Pose model could not be loaded from '%s'. Check that plugin content is enabled."),
+			*PoseModel.ToString());
+		return;
+	}
 
-    // 2. CARGAR MANUALMENTE
-    UE_LOG(LogTemp, Log, TEXT("[Kinemotion] Attempting to hard-load model from: %s"), ModelPath);
-    
-    // StaticLoadObject busca el asset en memoria o lo carga del disco
-    UObject* LoadedObject = StaticLoadObject(UNNEModelData::StaticClass(), nullptr, ModelPath);
+	TWeakInterfacePtr<INNERuntimeGPU> Runtime = UE::NNE::GetRuntime<INNERuntimeGPU>(NneRuntimeName.ToString());
+	if (!Runtime.IsValid())
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("NNE runtime '%s' is not available."), *NneRuntimeName.ToString());
+		return;
+	}
 
-    ModelData = Cast<UNNEModelData>(LoadedObject);
+	TSharedPtr<UE::NNE::IModelGPU> Model = Runtime->CreateModelGPU(ModelData);
+	if (!Model.IsValid())
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("Runtime '%s' could not build a model from the pose asset."),
+			*NneRuntimeName.ToString());
+		return;
+	}
 
-    if (!ModelData)
-    {
-        UE_LOG(LogTemp, Error, TEXT("[Kinemotion] CRITICAL ERROR: Could not load model at %s. Check Plugin Content is enabled and path is correct."), ModelPath);
-        return;
-    }
+	ModelInstance = Model->CreateModelInstanceGPU();
+	if (!ModelInstance.IsValid())
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("Failed to create a model instance."));
+		return;
+	}
 
-    // 3. CONTINUAR CON LA LÓGICA (Usando HardcodedModel)
-    
-    // Importante: Si estás probando el fix de CPU para empaquetar, usa esto:
-    // TWeakInterfacePtr<INNERuntimeCPU> SelectedRuntime = UE::NNE::GetRuntime<INNERuntimeCPU>(TEXT("NNERuntimeORTCpu"));
-    
-    // Si vas a intentar GPU otra vez (ahora que el cook no debería tocar la referencia):
-    TWeakInterfacePtr<INNERuntimeGPU> SelectedRuntime = UE::NNE::GetRuntime<INNERuntimeGPU>(TEXT("NNERuntimeORTDml"));
+	const TArray<UE::NNE::FTensorShape> InputShapes =
+	{
+		UE::NNE::FTensorShape::Make({
+			1,
+			static_cast<uint32>(KinemotionModel::InputChannels),
+			static_cast<uint32>(KinemotionModel::InputHeight),
+			static_cast<uint32>(KinemotionModel::InputWidth)
+		})
+	};
 
-    if (!SelectedRuntime.IsValid())
-    {
-        UE_LOG(LogTemp, Error, TEXT("[Kinemotion] No NNE Runtime found."));
-        return;
-    }
-	
-	TSharedPtr<UE::NNE::IModelGPU> Model = SelectedRuntime->CreateModelGPU(ModelData);
-    
-    if (Model.IsValid())
-    {
-    	ModelInstance = Model->CreateModelInstanceGPU();
-        if (ModelInstance.IsValid())
-        {
-            InputHeight = 384;
-            InputWidth = 288;
+	if (ModelInstance->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("Model rejected the input shape %dx%dx%d."),
+			KinemotionModel::InputChannels, KinemotionModel::InputHeight, KinemotionModel::InputWidth);
+		ModelInstance.Reset();
+		return;
+	}
 
-            TArray<UE::NNE::FTensorShape> InputShapes = {
-                UE::NNE::FTensorShape::Make({1, 3, (uint32)InputHeight, (uint32)InputWidth})
-            };
-
-        	if (ModelInstance->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
-        	{
-        		UE_LOG(LogTemp, Error, TEXT("[Kinemotion] Failed to set Input Shapes."));
-        	}
-        	else
-        	{
-        		UE_LOG(LogTemp, Warning, TEXT("[Kinemotion] Model Loaded & Initialized Successfully!"));
-        	}
-        }
-    }
+	UE_LOG(LogKinemotion, Log, TEXT("Pose model initialised on runtime '%s'."), *NneRuntimeName.ToString());
 }
-// --- WEBCAM ---
+
 void UKinemotionMocap::InitMedia()
 {
 	MediaPlayer = NewObject<UMediaPlayer>(this);
@@ -226,648 +384,545 @@ void UKinemotionMocap::InitMedia()
 	MediaTexture->UpdateResource();
 
 	TArray<FMediaCaptureDevice> Devices;
-	UMediaBlueprintFunctionLibrary::EnumerateVideoCaptureDevices(Devices, -1);
+	UMediaBlueprintFunctionLibrary::EnumerateVideoCaptureDevices(Devices, AllCaptureDeviceFilter);
 
-	if (Devices.IsValidIndex(CameraIndex))
+	if (!Devices.IsValidIndex(CameraIndex))
 	{
-		MediaPlayer->OpenUrl(Devices[CameraIndex].Url);
-		MediaPlayer->Play();
+		// Previously a silent no-op, which presented as the plugin simply not working.
+		UE_LOG(LogKinemotion, Error, TEXT("CameraIndex %d is out of range; %d capture device(s) found."),
+			CameraIndex, Devices.Num());
+		return;
 	}
+
+	MediaPlayer->OpenUrl(Devices[CameraIndex].Url);
+	MediaPlayer->Play();
+
+	UE_LOG(LogKinemotion, Log, TEXT("Opened capture device %d of %d."), CameraIndex, Devices.Num());
 }
 
-void UKinemotionMocap::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+// ---------------------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------------------
+
+void UKinemotionMocap::Recalibrate()
 {
-	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	bIsCalibrated = false;
+	bPelvisInitialized = false;
+	CalibrationAttempts = 0;
 
-	if (!bIsReadingFrame && ModelInstance && MediaTexture)
-	{
-		RequestTextureRead();
-	}
+	CalibrateFromSkeleton();
 }
+
+void UKinemotionMocap::CalibrateFromSkeleton()
+{
+	USkeletalMeshComponent* SkelMesh = FindSkeletalMesh();
+	if (!SkelMesh || !SkelMesh->GetSkeletalMeshAsset())
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("Calibration needs a skeletal mesh on the owning actor."));
+		return;
+	}
+
+	const FReferenceSkeleton& RefSkeleton = SkelMesh->GetSkeletalMeshAsset()->GetRefSkeleton();
+	const int32 PelvisIdx = RefSkeleton.FindBoneIndex(PelvisBoneName);
+	const int32 NeckIdx = RefSkeleton.FindBoneIndex(NeckBoneName);
+
+	if (PelvisIdx == INDEX_NONE || NeckIdx == INDEX_NONE)
+	{
+		UE_LOG(LogKinemotion, Error,
+			TEXT("Skeleton is missing '%s' or '%s'; Kinemotion expects the UE5 mannequin naming."),
+			*PelvisBoneName.ToString(), *NeckBoneName.ToString());
+		return;
+	}
+
+	const TArray<FTransform>& ComponentSpaceTransforms = SkelMesh->GetComponentSpaceTransforms();
+	if (ComponentSpaceTransforms.Num() == 0)
+	{
+		// The mesh has not evaluated its pose yet on the first frame of play. Retry next tick,
+		// but bounded: an unbounded retry against a mesh that never populates never terminates.
+		if (++CalibrationAttempts > MaxCalibrationAttempts)
+		{
+			UE_LOG(LogKinemotion, Error,
+				TEXT("Skeletal mesh produced no component-space transforms after %d attempts; giving up."),
+				MaxCalibrationAttempts);
+			return;
+		}
+
+		if (UWorld* World = GetWorld())
+		{
+			TWeakObjectPtr<UKinemotionMocap> WeakThis(this);
+			World->GetTimerManager().SetTimerForNextTick([WeakThis]()
+			{
+				if (UKinemotionMocap* Self = WeakThis.Get())
+				{
+					Self->CalibrateFromSkeleton();
+				}
+			});
+		}
+		return;
+	}
+
+	if (!ComponentSpaceTransforms.IsValidIndex(PelvisIdx))
+	{
+		UE_LOG(LogKinemotion, Error, TEXT("Pelvis index %d is outside the evaluated pose."), PelvisIdx);
+		return;
+	}
+
+	SkeletonBounds = SkelMesh->CalcBounds(FTransform::Identity).GetBox();
+	SkeletonHeight = SkeletonBounds.GetSize().Z;
+
+	const FVector PelvisLocation = ComponentSpaceTransforms[PelvisIdx].GetLocation();
+	SkeletonRootOffset = PelvisLocation;
+
+	// Floor anchor: the base of the mesh bounds, kept under the pelvis horizontally.
+	FloorRootLocal = FVector(PelvisLocation.X, PelvisLocation.Y, SkeletonBounds.Min.Z + FloorZOffset);
+
+	CalculateEffectiveScale();
+
+	// A pose measured against the previous calibration is not comparable to one measured
+	// against this, so the filter history is dropped rather than carried over.
+	PrevFilteredLocal.Reset();
+	PrevFilteredLocal.SetNumZeroed(KinemotionPointCount);
+	bHasFilteredSample.Init(false, KinemotionPointCount);
+
+	bIsCalibrated = true;
+	CalibrationAttempts = 0;
+
+	UE_LOG(LogKinemotion, Log,
+		TEXT("Calibrated. Height %.1f cm, pelvis Z %.1f, floor Z %.1f, scale %.1f."),
+		SkeletonHeight, PelvisLocation.Z, FloorRootLocal.Z, EffectiveIsotropicScale);
+}
+
+void UKinemotionMocap::CalculateEffectiveScale()
+{
+	const float ReferenceLength = bScaleRelativeToSkeleton ? SkeletonHeight : ReferenceSizeCM;
+
+	// A single factor for all three axes. Per-axis scaling was exposed previously but never
+	// applied, so poses could not be stretched independently and the properties did nothing.
+	EffectiveIsotropicScale = FMath::Max(1.0f, ReferenceLength) * FMath::Max(0.1f, StickmanScale);
+}
+
+// ---------------------------------------------------------------------------------------
+// Frame acquisition
+// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::RequestTextureRead()
 {
-	if (!MediaTexture || !MediaTexture->GetResource()) return;
+	if (!MediaTexture)
+	{
+		return;
+	}
 
-	bIsReadingFrame = true;
+	// Resolved here, on the game thread. The render-thread lambda must not touch the UObject:
+	// it may be collected while the command is queued.
+	FTextureResource* Resource = MediaTexture->GetResource();
+	if (!Resource)
+	{
+		return;
+	}
 
-	ENQUEUE_RENDER_COMMAND(ReadWebcamFrame)(
-		[this](FRHICommandListImmediate& RHICmdList)
+	bIsReadingFrame.store(true, std::memory_order_release);
+
+	// A weak pointer rather than a raw `this`. The previous version captured the component
+	// directly and wrote through it from both the render thread and a follow-up game-thread
+	// task, either of which can outlive a component destroyed mid-flight.
+	TWeakObjectPtr<UKinemotionMocap> WeakThis(this);
+
+	ENQUEUE_RENDER_COMMAND(KinemotionReadWebcamFrame)(
+		[WeakThis, Resource](FRHICommandListImmediate& RHICmdList)
 		{
-			FTextureResource* Resource = MediaTexture->GetResource();
-			if (!Resource || !Resource->GetTextureRHI()) { bIsReadingFrame = false; return; }
+			const auto AbortRead = [WeakThis]()
+			{
+				AsyncTask(ENamedThreads::GameThread, [WeakThis]()
+				{
+					if (UKinemotionMocap* Self = WeakThis.Get())
+					{
+						Self->OnFrameReadComplete(TArray<FColor>());
+					}
+				});
+			};
 
-			FTextureRHIRef TextureRHI = Resource->GetTextureRHI()->GetTexture2D();
-			if (!TextureRHI) { bIsReadingFrame = false; return; }
+			FRHITexture* TextureRHI = Resource->GetTextureRHI();
+			if (!TextureRHI || !TextureRHI->GetTexture2D())
+			{
+				AbortRead();
+				return;
+			}
 
-			// Corrección de API: GetSizeX en RHI es válido
-			const int32 W = TextureRHI->GetSizeX();
-			const int32 H = TextureRHI->GetSizeY();
+			const FIntPoint Size = TextureRHI->GetSizeXY();
 
-			TArray<FColor> LocalPixels;
+			TArray<FColor> Pixels;
 			FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
 			ReadFlags.SetLinearToGamma(false);
 
-			RHICmdList.ReadSurfaceData(TextureRHI, FIntRect(0, 0, W, H), LocalPixels, ReadFlags);
+			RHICmdList.ReadSurfaceData(TextureRHI, FIntRect(0, 0, Size.X, Size.Y), Pixels, ReadFlags);
 
-			AsyncTask(ENamedThreads::GameThread, [this, LocalPixels = MoveTemp(LocalPixels)]()
+			AsyncTask(ENamedThreads::GameThread, [WeakThis, Pixels = MoveTemp(Pixels)]() mutable
+			{
+				if (UKinemotionMocap* Self = WeakThis.Get())
 				{
-					this->RawPixels = LocalPixels;
-					this->OnFrameReadComplete();
-				});
-		}
-		);
+					Self->OnFrameReadComplete(MoveTemp(Pixels));
+				}
+			});
+		});
 }
 
-void UKinemotionMocap::OnFrameReadComplete()
+void UKinemotionMocap::OnFrameReadComplete(TArray<FColor>&& Pixels)
 {
+	RawPixels = MoveTemp(Pixels);
+
 	if (RawPixels.Num() > 0)
 	{
 		PreProcessImage();
 		RunInference();
 	}
-	bIsReadingFrame = false;
+
+	// Cleared last, so the next tick cannot queue a read while this one is still decoding.
+	bIsReadingFrame.store(false, std::memory_order_release);
 }
 
 void UKinemotionMocap::PreProcessImage()
 {
-	int32 NumElements = InputWidth * InputHeight * 3;
-	if (InputTensor.Num() != NumElements) InputTensor.SetNumUninitialized(NumElements);
-
-	int32 SrcW = MediaTexture->GetWidth();
-	int32 SrcH = MediaTexture->GetHeight();
-	if (SrcW <= 0) return;
-
-	// ✅ Renombrado para evitar conflicto
-	const float SampleScaleX = (float)SrcW / (float)InputWidth;
-	const float SampleScaleY = (float)SrcH / (float)InputHeight;
-
-	float* RPtr = InputTensor.GetData();
-	float* GPtr = RPtr + (InputWidth * InputHeight);
-	float* BPtr = GPtr + (InputWidth * InputHeight);
-
-	for (int32 y = 0; y < InputHeight; y++)
+	if (!MediaTexture)
 	{
-		for (int32 x = 0; x < InputWidth; x++)
+		return;
+	}
+
+	const int32 SourceWidth = MediaTexture->GetWidth();
+	const int32 SourceHeight = MediaTexture->GetHeight();
+	if (SourceWidth <= 0 || SourceHeight <= 0)
+	{
+		return;
+	}
+
+	if (InputTensor.Num() != KinemotionModel::InputElementCount)
+	{
+		InputTensor.SetNumUninitialized(KinemotionModel::InputElementCount);
+	}
+
+	// Nearest-neighbour resample from the camera frame to the network's input resolution.
+	const float SampleScaleX = static_cast<float>(SourceWidth) / static_cast<float>(KinemotionModel::InputWidth);
+	const float SampleScaleY = static_cast<float>(SourceHeight) / static_cast<float>(KinemotionModel::InputHeight);
+
+	// Planar layout: the model expects all red, then all green, then all blue.
+	constexpr int32 PlaneStride = KinemotionModel::InputWidth * KinemotionModel::InputHeight;
+	float* RedPlane = InputTensor.GetData();
+	float* GreenPlane = RedPlane + PlaneStride;
+	float* BluePlane = GreenPlane + PlaneStride;
+
+	for (int32 Y = 0; Y < KinemotionModel::InputHeight; ++Y)
+	{
+		const int32 SourceY = FMath::FloorToInt32(Y * SampleScaleY);
+
+		for (int32 X = 0; X < KinemotionModel::InputWidth; ++X)
 		{
-			int32 Sx = FMath::FloorToInt(x * SampleScaleX);
-			int32 Sy = FMath::FloorToInt(y * SampleScaleY);
-			int32 SrcIdx = (Sy * SrcW) + Sx;
+			const int32 SourceX = FMath::FloorToInt32(X * SampleScaleX);
+			const int32 SourceIndex = (SourceY * SourceWidth) + SourceX;
+			const int32 DestIndex = (Y * KinemotionModel::InputWidth) + X;
 
-			if (RawPixels.IsValidIndex(SrcIdx))
+			if (!RawPixels.IsValidIndex(SourceIndex))
 			{
-				FColor Pixel = RawPixels[SrcIdx];
-				int32 DestIdx = (y * InputWidth) + x;
-
-				RPtr[DestIdx] = Pixel.R / 255.0f;
-				GPtr[DestIdx] = Pixel.G / 255.0f;
-				BPtr[DestIdx] = Pixel.B / 255.0f;
+				continue;
 			}
+
+			const FColor& Pixel = RawPixels[SourceIndex];
+			RedPlane[DestIndex] = Pixel.R / KinemotionModel::ColorChannelMax;
+			GreenPlane[DestIndex] = Pixel.G / KinemotionModel::ColorChannelMax;
+			BluePlane[DestIndex] = Pixel.B / KinemotionModel::ColorChannelMax;
 		}
 	}
 }
 
 void UKinemotionMocap::RunInference()
 {
-	if (!ModelInstance) return;
+	if (!ModelInstance.IsValid())
+	{
+		return;
+	}
+
+	if (OutputTensorX.Num() != KinemotionModel::OutputElementCountX)
+	{
+		OutputTensorX.SetNumUninitialized(KinemotionModel::OutputElementCountX);
+	}
+	if (OutputTensorY.Num() != KinemotionModel::OutputElementCountY)
+	{
+		OutputTensorY.SetNumUninitialized(KinemotionModel::OutputElementCountY);
+	}
+	if (OutputTensorZ.Num() != KinemotionModel::OutputElementCountZ)
+	{
+		OutputTensorZ.SetNumUninitialized(KinemotionModel::OutputElementCountZ);
+	}
+
+	const auto BindTensor = [](UE::NNE::FTensorBindingCPU& Binding, TArray<float>& Storage)
+	{
+		Binding.Data = Storage.GetData();
+		Binding.SizeInBytes = Storage.Num() * sizeof(float);
+	};
 
 	InputBindings.SetNum(1);
-	InputBindings[0].Data = InputTensor.GetData();
-	InputBindings[0].SizeInBytes = InputTensor.Num() * sizeof(float);
-
-	// Salidas SimCC (X: 133*576, Y: 133*768, Z: 133*576)
-	int32 SizeX = 133 * 576;
-	int32 SizeY = 133 * 768;
-	int32 SizeZ = 133 * 576;
-
-	if (OutputTensorX.Num() != SizeX) OutputTensorX.SetNumUninitialized(SizeX);
-	if (OutputTensorY.Num() != SizeY) OutputTensorY.SetNumUninitialized(SizeY);
-	if (OutputTensorZ.Num() != SizeZ) OutputTensorZ.SetNumUninitialized(SizeZ);
+	BindTensor(InputBindings[0], InputTensor);
 
 	OutputBindings.SetNum(3);
-	OutputBindings[0].Data = OutputTensorX.GetData(); OutputBindings[0].SizeInBytes = OutputTensorX.Num() * sizeof(float);
-	OutputBindings[1].Data = OutputTensorY.GetData(); OutputBindings[1].SizeInBytes = OutputTensorY.Num() * sizeof(float);
-	OutputBindings[2].Data = OutputTensorZ.GetData(); OutputBindings[2].SizeInBytes = OutputTensorZ.Num() * sizeof(float);
+	BindTensor(OutputBindings[0], OutputTensorX);
+	BindTensor(OutputBindings[1], OutputTensorY);
+	BindTensor(OutputBindings[2], OutputTensorZ);
 
 	if (ModelInstance->RunSync(InputBindings, OutputBindings) == UE::NNE::EResultStatus::Ok)
 	{
-		DecodeAndSend(OutputTensorX, OutputTensorY, OutputTensorZ);
+		DecodeAndPublish();
 	}
 }
 
-float UKinemotionMocap::GetArgMax(const float* Buffer, int32 Size)
+// ---------------------------------------------------------------------------------------
+// Decode and publish
+// ---------------------------------------------------------------------------------------
+
+void UKinemotionMocap::DecodeAndPublish()
 {
-	float MaxVal = -FLT_MAX;
-	int32 MaxIdx = 0;
-	for (int32 i = 0; i < Size; i++) {
-		if (Buffer[i] > MaxVal) { MaxVal = Buffer[i]; MaxIdx = i; }
-	}
-	return (float)MaxIdx / (float)Size;
-}
-
-void UKinemotionMocap::DecodeAndSend(const TArray<float>& X, const TArray<float>& Y, const TArray<float>& Z)
-{
-	if (!bLiveLinkRegistered || !bIsCalibrated) return;
-	if (X.Num() == 0) return;
-
-	if (!bPelvisInitialized)
+	if (!bLiveLinkRegistered || !bIsCalibrated)
 	{
-		USkeletalMeshComponent* SkelMesh = GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
-		if (SkelMesh)
-		{
-			// Obtener posición de la pelvis del skeleton en world space
-			int32 PelvisIdx = SkelMesh->GetBoneIndex(FName("pelvis"));
-			if (PelvisIdx != INDEX_NONE)
-			{
-				InitialPelvisWorld = SkelMesh->GetBoneLocation(FName("pelvis"));
-				bPelvisInitialized = true;
-
-				UE_LOG(LogTemp, Warning, TEXT("[Kinemotion] ✓ Pelvis inicial capturada: %s"), *InitialPelvisWorld.ToString());
-			}
-		}
+		return;
 	}
 
-	const int32 NumJoints = 133;
-	const int32 DimX = 576, DimY = 768, DimZ = 576;
-
-	// -------------------------------------------------------------------------
-	// A. DECODIFICAR KEYPOINTS NORMALIZADOS (0-1)
-	// -------------------------------------------------------------------------
-	auto GetDecodedPoint = [&](int32 JointIdx) -> FVector {
-		if (JointIdx >= NumJoints) return FVector::ZeroVector;
-
-		const float* PtrX = X.GetData() + (JointIdx * DimX);
-		const float* PtrY = Y.GetData() + (JointIdx * DimY);
-		const float* PtrZ = Z.GetData() + (JointIdx * DimZ);
-
-		float NormX = GetArgMax(PtrX, DimX);
-		float NormY = GetArgMax(PtrY, DimY);
-		float NormZ = GetArgMax(PtrZ, DimZ);
-
-		if (FMath::IsNaN(NormX)) return FVector::ZeroVector;
-
-		FVector P;
-		P.X = NormZ;           // Profundidad
-		P.Y = NormX;           // Ancho
-		P.Z = 1.0f - NormY;    // Alto (invertido)
-		return P;
-		};
-
-	// Decodificar puntos
-	FVector Nose = GetDecodedPoint(0);
-	FVector LShoulder = GetDecodedPoint(5);
-	FVector RShoulder = GetDecodedPoint(6);
-	FVector LElbow = GetDecodedPoint(7);
-	FVector RElbow = GetDecodedPoint(8);
-	FVector LWrist = GetDecodedPoint(9);
-	FVector RWrist = GetDecodedPoint(10);
-	FVector LHip = GetDecodedPoint(11);
-	FVector RHip = GetDecodedPoint(12);
-	FVector LKnee = GetDecodedPoint(13);
-	FVector RKnee = GetDecodedPoint(14);
-	FVector LAnkle = GetDecodedPoint(15);
-	FVector RAnkle = GetDecodedPoint(16);
-
-	// Puntos virtuales
-	FVector HipCenter = (LHip + RHip) * 0.5f;
-	FVector NeckBase = (LShoulder + RShoulder) * 0.5f;
-	FVector SpineMid = (HipCenter + NeckBase) * 0.5f;
-	FVector LClavicle = FMath::Lerp(NeckBase, LShoulder, 0.3f);
-	FVector RClavicle = FMath::Lerp(NeckBase, RShoulder, 0.3f);
-
-	// -------------------------------------------------------------------------
-	// B. CENTRAR Y ESCALAR (Isotrópico 1:1:1)
-	// -------------------------------------------------------------------------
-	auto NormalizeAndProject = [&](const FVector& Point) -> FVector {
-		const FVector Centered = Point - HipCenter;
-		return Centered * EffectiveIsotropicScale;
-		};
-
-	FVector NoseLocal = NormalizeAndProject(Nose);
-	FVector LShoulderLocal = NormalizeAndProject(LShoulder);
-	FVector RShoulderLocal = NormalizeAndProject(RShoulder);
-	FVector LElbowLocal = NormalizeAndProject(LElbow);
-	FVector RElbowLocal = NormalizeAndProject(RElbow);
-	FVector LWristLocal = NormalizeAndProject(LWrist);
-	FVector RWristLocal = NormalizeAndProject(RWrist);
-	FVector LHipLocal = NormalizeAndProject(LHip);
-	FVector RHipLocal = NormalizeAndProject(RHip);
-	FVector LKneeLocal = NormalizeAndProject(LKnee);
-	FVector RKneeLocal = NormalizeAndProject(RKnee);
-	FVector LAnkleLocal = NormalizeAndProject(LAnkle);
-	FVector RAnkleLocal = NormalizeAndProject(RAnkle);
-
-	FVector HipCenterLocal = FVector::ZeroVector; // Origen antes de ajuste
-	FVector NeckBaseLocal = NormalizeAndProject(NeckBase);
-	FVector SpineMidLocal = NormalizeAndProject(SpineMid);
-	FVector LClavicleLocal = NormalizeAndProject(LClavicle);
-	FVector RClavicleLocal = NormalizeAndProject(RClavicle);
-
-	// -------------------------------------------------------------------------
-	// C. ROTACIÓN DE CORRECCIÓN
-	// -------------------------------------------------------------------------
-	FQuat LocalRotation = FQuat(FRotator(0.0f, 90.0f, 0.0f));
-
-	auto RotateLocal = [&](const FVector& V) -> FVector {
-		return LocalRotation.RotateVector(V);
-		};
-
-	NoseLocal = RotateLocal(NoseLocal);
-	LShoulderLocal = RotateLocal(LShoulderLocal);
-	RShoulderLocal = RotateLocal(RShoulderLocal);
-	LElbowLocal = RotateLocal(LElbowLocal);
-	RElbowLocal = RotateLocal(RElbowLocal);
-	LWristLocal = RotateLocal(LWristLocal);
-	RWristLocal = RotateLocal(RWristLocal);
-	LHipLocal = RotateLocal(LHipLocal);
-	RHipLocal = RotateLocal(RHipLocal);
-	LKneeLocal = RotateLocal(LKneeLocal);
-	RKneeLocal = RotateLocal(RKneeLocal);
-	LAnkleLocal = RotateLocal(LAnkleLocal);
-	RAnkleLocal = RotateLocal(RAnkleLocal);
-	NeckBaseLocal = RotateLocal(NeckBaseLocal);
-	SpineMidLocal = RotateLocal(SpineMidLocal);
-	LClavicleLocal = RotateLocal(LClavicleLocal);
-	RClavicleLocal = RotateLocal(RClavicleLocal);
-
-	// -------------------------------------------------------------------------
-	// D. DETERMINAR ROOT Y AJUSTAR A COMPONENT SPACE
-	// -------------------------------------------------------------------------
-	FVector RootLocal;
-
-	if (bUseFloorAsRoot)
+	USkeletalMeshComponent* SkelMesh = FindSkeletalMesh();
+	if (!SkelMesh)
 	{
-		// Root en el suelo (base del bounding box)
-		// X/Y siguen a la cadera detectada, Z fijo en el suelo
-		RootLocal = FVector(
-			FloorRootLocal.X + HipCenterLocal.X, // X sigue movimiento horizontal
-			FloorRootLocal.Y + HipCenterLocal.Y, // Y sigue movimiento horizontal  
-			FloorRootLocal.Z                      // Z fijo en el suelo
-		);
+		return;
 	}
-	else
+
+	if (!bPelvisInitialized && SkelMesh->GetBoneIndex(PelvisBoneName) != INDEX_NONE)
 	{
-		// Root tradicional en la pelvis
-		RootLocal = SkeletonRootOffset;
+		InitialPelvisWorld = SkelMesh->GetBoneLocation(PelvisBoneName);
+		bPelvisInitialized = true;
 	}
 
-	// Ajustar todos los puntos al component space
-	auto AdjustToSkeletonSpace = [&](const FVector& LocalPos) -> FVector {
-		if (bUseFloorAsRoot)
-		{
-			// Relativo al floor root
-			return LocalPos + SkeletonRootOffset;
-		}
-		else
-		{
-			return LocalPos + SkeletonRootOffset;
-		}
-		};
+	// -- Decode ------------------------------------------------------------------------
 
-	NoseLocal = AdjustToSkeletonSpace(NoseLocal);
-	LShoulderLocal = AdjustToSkeletonSpace(LShoulderLocal);
-	RShoulderLocal = AdjustToSkeletonSpace(RShoulderLocal);
-	LElbowLocal = AdjustToSkeletonSpace(LElbowLocal);
-	RElbowLocal = AdjustToSkeletonSpace(RElbowLocal);
-	LWristLocal = AdjustToSkeletonSpace(LWristLocal);
-	RWristLocal = AdjustToSkeletonSpace(RWristLocal);
-	LHipLocal = AdjustToSkeletonSpace(LHipLocal);
-	RHipLocal = AdjustToSkeletonSpace(RHipLocal);
-	LKneeLocal = AdjustToSkeletonSpace(LKneeLocal);
-	RKneeLocal = AdjustToSkeletonSpace(RKneeLocal);
-	LAnkleLocal = AdjustToSkeletonSpace(LAnkleLocal);
-	RAnkleLocal = AdjustToSkeletonSpace(RAnkleLocal);
-	HipCenterLocal = AdjustToSkeletonSpace(HipCenterLocal);
-	NeckBaseLocal = AdjustToSkeletonSpace(NeckBaseLocal);
-	SpineMidLocal = AdjustToSkeletonSpace(SpineMidLocal);
-	LClavicleLocal = AdjustToSkeletonSpace(LClavicleLocal);
-	RClavicleLocal = AdjustToSkeletonSpace(RClavicleLocal);
+	const auto DecodeKeypoint = [this](int32 ModelIndex) -> FVector
+	{
+		const float* AxisX = OutputTensorX.GetData() + (ModelIndex * KinemotionModel::SimccBinsX);
+		const float* AxisY = OutputTensorY.GetData() + (ModelIndex * KinemotionModel::SimccBinsY);
+		const float* AxisZ = OutputTensorZ.GetData() + (ModelIndex * KinemotionModel::SimccBinsZ);
 
-	// -------------------------------------------------------------------------
-	// E. APLICAR SUAVIZADO ANTI-JITTER
-	// -------------------------------------------------------------------------
-	NoseLocal = ApplySmoothing(EKinemotionPoint::Nose, NoseLocal);
-	LShoulderLocal = ApplySmoothing(EKinemotionPoint::LeftShoulder, LShoulderLocal);
-	RShoulderLocal = ApplySmoothing(EKinemotionPoint::RightShoulder, RShoulderLocal);
-	LElbowLocal = ApplySmoothing(EKinemotionPoint::LeftElbow, LElbowLocal);
-	RElbowLocal = ApplySmoothing(EKinemotionPoint::RightElbow, RElbowLocal);
-	LWristLocal = ApplySmoothing(EKinemotionPoint::LeftWrist, LWristLocal);
-	RWristLocal = ApplySmoothing(EKinemotionPoint::RightWrist, RWristLocal);
-	LHipLocal = ApplySmoothing(EKinemotionPoint::LeftHip, LHipLocal);
-	RHipLocal = ApplySmoothing(EKinemotionPoint::RightHip, RHipLocal);
-	LKneeLocal = ApplySmoothing(EKinemotionPoint::LeftKnee, LKneeLocal);
-	RKneeLocal = ApplySmoothing(EKinemotionPoint::RightKnee, RKneeLocal);
-	LAnkleLocal = ApplySmoothing(EKinemotionPoint::LeftAnkle, LAnkleLocal);
-	RAnkleLocal = ApplySmoothing(EKinemotionPoint::RightAnkle, RAnkleLocal);
-	HipCenterLocal = ApplySmoothing(EKinemotionPoint::HipCenter, HipCenterLocal);
-	NeckBaseLocal = ApplySmoothing(EKinemotionPoint::NeckBase, NeckBaseLocal);
-	SpineMidLocal = ApplySmoothing(EKinemotionPoint::SpineMid, SpineMidLocal);
-	LClavicleLocal = ApplySmoothing(EKinemotionPoint::LeftClavicle, LClavicleLocal);
-	RClavicleLocal = ApplySmoothing(EKinemotionPoint::RightClavicle, RClavicleLocal);
+		// The model's axes do not match Unreal's: its Z is depth, its X is image width, and
+		// its Y grows downward - hence the inversion on height.
+		const FVector Decoded(
+			DecodeSimccAxis(AxisZ, KinemotionModel::SimccBinsZ),
+			DecodeSimccAxis(AxisX, KinemotionModel::SimccBinsX),
+			1.0f - DecodeSimccAxis(AxisY, KinemotionModel::SimccBinsY));
 
-	// -------------------------------------------------------------------------
-	// F. CONVERTIR A WORLD SPACE
-	// -------------------------------------------------------------------------
-	USkeletalMeshComponent* SkelMesh = GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
-	if (!SkelMesh) return;
+		return Decoded.ContainsNaN() ? FVector::ZeroVector : Decoded;
+	};
 
-	FTransform ComponentTransform = SkelMesh->GetComponentTransform();
+	TArray<FVector> RawPose;
+	RawPose.SetNumZeroed(KinemotionPointCount);
 
-	// Calcular offset para que el stickman parta de la pelvis real del mesh
-	FVector StickmanPelvisComponent = HipCenterLocal;
-	FVector StickmanPelvisWorld = ComponentTransform.TransformPosition(StickmanPelvisComponent);
+	for (const FKinemotionKeypointMapping& Mapping : KinemotionDecodedPoints)
+	{
+		RawPose[static_cast<int32>(Mapping.Point)] = DecodeKeypoint(Mapping.ModelIndex);
+	}
 
-	// Offset entre la pelvis real inicial y donde estaría el stickman
+	// -- Derive the points the model does not predict -----------------------------------
+
+	const FVector LeftHip = RawPose[static_cast<int32>(EKinemotionPoint::LeftHip)];
+	const FVector RightHip = RawPose[static_cast<int32>(EKinemotionPoint::RightHip)];
+	const FVector LeftShoulder = RawPose[static_cast<int32>(EKinemotionPoint::LeftShoulder)];
+	const FVector RightShoulder = RawPose[static_cast<int32>(EKinemotionPoint::RightShoulder)];
+
+	const FVector HipCenter = (LeftHip + RightHip) * SymmetricPairMidpoint;
+	const FVector NeckBase = (LeftShoulder + RightShoulder) * SymmetricPairMidpoint;
+
+	RawPose[static_cast<int32>(EKinemotionPoint::HipCenter)] = HipCenter;
+	RawPose[static_cast<int32>(EKinemotionPoint::NeckBase)] = NeckBase;
+	RawPose[static_cast<int32>(EKinemotionPoint::SpineMid)] = (HipCenter + NeckBase) * SymmetricPairMidpoint;
+	RawPose[static_cast<int32>(EKinemotionPoint::LeftClavicle)] = FMath::Lerp(NeckBase, LeftShoulder, ClavicleBlend);
+	RawPose[static_cast<int32>(EKinemotionPoint::RightClavicle)] = FMath::Lerp(NeckBase, RightShoulder, ClavicleBlend);
+
+	// -- Into component space -----------------------------------------------------------
+
+	// Centring, scaling, axis correction, the root offset and smoothing used to be five
+	// sequential passes over eighteen individually named locals. One pass, one array.
+	const FQuat AxisCorrection(FRotator(0.0f, YawCorrectionDegrees, 0.0f));
+
+	for (int32 PointIndex = 0; PointIndex < KinemotionPointCount; ++PointIndex)
+	{
+		const FVector Centered = (RawPose[PointIndex] - HipCenter) * EffectiveIsotropicScale;
+		const FVector Oriented = AxisCorrection.RotateVector(Centered) + SkeletonRootOffset;
+
+		PoseLocal[PointIndex] = ApplySmoothing(static_cast<EKinemotionPoint>(PointIndex), Oriented);
+	}
+
+	// -- Into world space, for consumers ------------------------------------------------
+
+	const FTransform ComponentTransform = SkelMesh->GetComponentTransform();
+
+	// Anchor the capture on the mesh's actual pelvis so the tracked figure and the mesh
+	// occupy the same place rather than drifting apart.
 	FVector WorldOffset = FVector::ZeroVector;
 	if (bPelvisInitialized)
 	{
-		// Calcular diferencia solo en el primer frame o mantener el offset
-		FVector CurrentMeshPelvis = SkelMesh->GetBoneLocation(FName("pelvis"));
-		WorldOffset = CurrentMeshPelvis - StickmanPelvisWorld;
+		const FVector TrackedPelvisWorld =
+			ComponentTransform.TransformPosition(PoseLocal[static_cast<int32>(EKinemotionPoint::HipCenter)]);
+		WorldOffset = SkelMesh->GetBoneLocation(PelvisBoneName) - TrackedPelvisWorld;
 	}
 
-	auto ToWorldSpace = [&](const FVector& ComponentPos) -> FVector {
-		FVector WorldPos = ComponentTransform.TransformPosition(ComponentPos);
-		return WorldPos + WorldOffset;
-		};
-
-	CachedWorldPoints.Empty();
-	CachedWorldPoints.Add(EKinemotionPoint::Nose, ToWorldSpace(NoseLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftShoulder, ToWorldSpace(LShoulderLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightShoulder, ToWorldSpace(RShoulderLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftElbow, ToWorldSpace(LElbowLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightElbow, ToWorldSpace(RElbowLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftWrist, ToWorldSpace(LWristLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightWrist, ToWorldSpace(RWristLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftHip, ToWorldSpace(LHipLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightHip, ToWorldSpace(RHipLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftKnee, ToWorldSpace(LKneeLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightKnee, ToWorldSpace(RKneeLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftAnkle, ToWorldSpace(LAnkleLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightAnkle, ToWorldSpace(RAnkleLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::HipCenter, ToWorldSpace(HipCenterLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::NeckBase, ToWorldSpace(NeckBaseLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::SpineMid, ToWorldSpace(SpineMidLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::LeftClavicle, ToWorldSpace(LClavicleLocal));
-	CachedWorldPoints.Add(EKinemotionPoint::RightClavicle, ToWorldSpace(RClavicleLocal));
-
-	// -------------------------------------------------------------------------
-	// G. DEBUG VISUAL (sin cambios significativos)
-	// -------------------------------------------------------------------------
-	if (bShowDebug && GetWorld())
+	CachedWorldPoints.Reset();
+	CachedWorldPoints.Reserve(KinemotionPointCount);
+	for (int32 PointIndex = 0; PointIndex < KinemotionPointCount; ++PointIndex)
 	{
-		// Dibujar esferas de los puntos
-		for (const auto& Elem : CachedWorldPoints)
-		{
-			DrawDebugSphere(GetWorld(), Elem.Value, 5.0f, 8, FColor::Red, false, 0.05f, 0, 1.0f);
-		}
-
-		// Dibujar líneas de huesos
-		auto DrawBone = [&](EKinemotionPoint Start, EKinemotionPoint End) {
-			if (CachedWorldPoints.Contains(Start) && CachedWorldPoints.Contains(End))
-			{
-				DrawDebugLine(GetWorld(), CachedWorldPoints[Start], CachedWorldPoints[End],
-					FColor::Green, false, 0.05f, 0, 2.0f);
-			}
-			};
-
-		DrawBone(EKinemotionPoint::NeckBase, EKinemotionPoint::HipCenter);
-		DrawBone(EKinemotionPoint::LeftShoulder, EKinemotionPoint::RightShoulder);
-		DrawBone(EKinemotionPoint::LeftHip, EKinemotionPoint::RightHip);
-		DrawBone(EKinemotionPoint::LeftShoulder, EKinemotionPoint::LeftElbow);
-		DrawBone(EKinemotionPoint::LeftElbow, EKinemotionPoint::LeftWrist);
-		DrawBone(EKinemotionPoint::RightShoulder, EKinemotionPoint::RightElbow);
-		DrawBone(EKinemotionPoint::RightElbow, EKinemotionPoint::RightWrist);
-		DrawBone(EKinemotionPoint::LeftHip, EKinemotionPoint::LeftKnee);
-		DrawBone(EKinemotionPoint::LeftKnee, EKinemotionPoint::LeftAnkle);
-		DrawBone(EKinemotionPoint::RightHip, EKinemotionPoint::RightKnee);
-		DrawBone(EKinemotionPoint::RightKnee, EKinemotionPoint::RightAnkle);
-
-		// Debug adicional
-		FVector CompLocation = ComponentTransform.GetLocation();
-		DrawDebugSphere(GetWorld(), CompLocation, 10.0f, 12, FColor::Yellow, false, 0.05f, 0, 2.0f);
-
-		FVector PelvisWorld = ToWorldSpace(SkeletonRootOffset);
-		DrawDebugSphere(GetWorld(), PelvisWorld, 8.0f, 12, FColor::Cyan, false, 0.05f, 0, 2.0f);
-
-		FBox WorldBounds = SkeletonBounds.TransformBy(ComponentTransform);
-		DrawDebugBox(GetWorld(), WorldBounds.GetCenter(), WorldBounds.GetExtent(),
-			ComponentTransform.GetRotation(), FColor::Magenta, false, 0.05f, 0, 2.0f);
-
-		// Floor root
-		if (bUseFloorAsRoot)
-		{
-			FVector FloorWorld = ToWorldSpace(FloorRootLocal);
-			DrawDebugSphere(GetWorld(), FloorWorld, 10.0f, 12, FColor::Blue, false, 0.05f, 0, 2.0f);
-		}
+		CachedWorldPoints.Add(
+			static_cast<EKinemotionPoint>(PointIndex),
+			ComponentTransform.TransformPosition(PoseLocal[PointIndex]) + WorldOffset);
 	}
 
-	// -------------------------------------------------------------------------
-	// H. PREPARAR DATOS PARA LIVE LINK
-	// -------------------------------------------------------------------------
+#if ENABLE_DRAW_DEBUG
+	if (bShowDebug)
+	{
+		if (const UWorld* World = GetWorld())
+		{
+			DrawDebugPose(*World);
+		}
+	}
+#endif
+
+	// -- Publish ------------------------------------------------------------------------
+
 	FLiveLinkFrameDataStruct FrameData(FLiveLinkAnimationFrameData::StaticStruct());
 	FLiveLinkAnimationFrameData* AnimData = FrameData.Cast<FLiveLinkAnimationFrameData>();
-	AnimData->Transforms.SetNum(19);
+	AnimData->Transforms.SetNum(KinemotionBoneCount);
 
-	auto SetBoneData = [&](int32 Index, const FVector& Location, const FVector& ParentLocation) {
-		AnimData->Transforms[Index].SetLocation(Location - ParentLocation);
-		AnimData->Transforms[Index].SetRotation(FQuat::Identity);
-		AnimData->Transforms[Index].SetScale3D(FVector::OneVector);
-		};
+	const FVector RootLocal = bUseFloorAsRoot ? FloorRootLocal : SkeletonRootOffset;
+	AnimData->Transforms[RootBoneIndex] = FTransform(FQuat::Identity, RootLocal, FVector::OneVector);
 
-	// Calcular posición del root (base del bounding box)
-	RootLocal = bUseFloorAsRoot ? FloorRootLocal : SkeletonRootOffset;
-
-	// ROOT (index 0)
-	AnimData->Transforms[0].SetLocation(RootLocal);
-	AnimData->Transforms[0].SetRotation(FQuat::Identity);
-	AnimData->Transforms[0].SetScale3D(FVector::OneVector);
-
-	// PELVIS (index 1) - relativa al root
-	if (bPelvisFree)
+	FVector PelvisLocal = PoseLocal[static_cast<int32>(EKinemotionPoint::HipCenter)] - RootLocal;
+	if (!bPelvisFree)
 	{
-		// Pelvis libre: puede moverse respecto al root
-		AnimData->Transforms[1].SetLocation(HipCenterLocal - RootLocal);
+		// Pinned vertically: horizontal movement still tracks, but the pelvis keeps the height
+		// it had at calibration so the figure cannot sink or float.
+		PelvisLocal.Z = SkeletonRootOffset.Z - RootLocal.Z;
 	}
-	else
+	AnimData->Transforms[PelvisBoneIndex] = FTransform(FQuat::Identity, PelvisLocal, FVector::OneVector);
+
+	for (int32 BoneIndex = FirstDrivenBoneIndex; BoneIndex < KinemotionBoneCount; ++BoneIndex)
 	{
-		// Pelvis fija verticalmente (solo X/Y siguen al tracking)
-		FVector FixedPelvis = HipCenterLocal - RootLocal;
-		FixedPelvis.Z = SkeletonRootOffset.Z - RootLocal.Z; // Mantener Z original
-		AnimData->Transforms[1].SetLocation(FixedPelvis);
+		const FKinemotionBoneDef& Bone = KinemotionRig[BoneIndex];
+		const FVector BoneLocal =
+			PoseLocal[static_cast<int32>(Bone.Point)] - PoseLocal[static_cast<int32>(Bone.ReferencePoint)];
+
+		AnimData->Transforms[BoneIndex] = FTransform(FQuat::Identity, BoneLocal, FVector::OneVector);
 	}
-	AnimData->Transforms[1].SetRotation(FQuat::Identity);
-	AnimData->Transforms[1].SetScale3D(FVector::OneVector);
 
-	// Referencia para el resto de huesos
-	FVector PelvisRef = HipCenterLocal; // Siempre usar la posición real de la pelvis
-
-	SetBoneData(2, SpineMidLocal, PelvisRef);      // spine_01
-	SetBoneData(3, NeckBaseLocal, SpineMidLocal);  // neck_01
-	SetBoneData(4, NoseLocal, NeckBaseLocal);      // head
-
-	SetBoneData(5, LClavicleLocal, NeckBaseLocal);
-	SetBoneData(6, LShoulderLocal, LClavicleLocal);
-	SetBoneData(7, LElbowLocal, LShoulderLocal);
-	SetBoneData(8, LWristLocal, LElbowLocal);
-
-	SetBoneData(9, RClavicleLocal, NeckBaseLocal);
-	SetBoneData(10, RShoulderLocal, RClavicleLocal);
-	SetBoneData(11, RElbowLocal, RShoulderLocal);
-	SetBoneData(12, RWristLocal, RElbowLocal);
-
-	SetBoneData(13, LHipLocal, PelvisRef);
-	SetBoneData(14, LKneeLocal, LHipLocal);
-	SetBoneData(15, LAnkleLocal, LKneeLocal);
-
-	SetBoneData(16, RHipLocal, PelvisRef);
-	SetBoneData(17, RKneeLocal, RHipLocal);
-	SetBoneData(18, RAnkleLocal, RKneeLocal);
-
-	// -------------------------------------------------------------------------
-	// I. ENVIAR A LIVE LINK
-	// -------------------------------------------------------------------------
 	if (IModularFeatures::Get().IsModularFeatureAvailable(ILiveLinkClient::ModularFeatureName))
 	{
-		ILiveLinkClient* LiveLinkClient = &IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
+		ILiveLinkClient& LiveLinkClient =
+			IModularFeatures::Get().GetModularFeature<ILiveLinkClient>(ILiveLinkClient::ModularFeatureName);
 
-		FTimecode TC = FTimecode();
-		AnimData->MetaData.SceneTime = FQualifiedFrameTime(TC, FFrameRate(60, 1));
+		AnimData->MetaData.SceneTime = FQualifiedFrameTime(FTimecode(), FFrameRate(LiveLinkFrameRate, 1));
 
-		LiveLinkClient->PushSubjectFrameData_AnyThread(SubjectKey, MoveTemp(FrameData));
+		LiveLinkClient.PushSubjectFrameData_AnyThread(SubjectKey, MoveTemp(FrameData));
 	}
 }
 
-TMap<EKinemotionPoint, FVector> UKinemotionMocap::GetDetectedBodyPoints()
+TMap<EKinemotionPoint, FVector> UKinemotionMocap::GetDetectedBodyPoints() const
 {
-	// Devuelve el mapa almacenado en el último frame procesado
 	return CachedWorldPoints;
 }
 
-void UKinemotionMocap::CalibrateFromSkeleton()
-{
-	USkeletalMeshComponent* SkelMesh = GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
-	if (!SkelMesh || !SkelMesh->GetSkeletalMeshAsset())
-	{
-		UE_LOG(LogTemp, Error, TEXT("[Kinemotion] No SkeletalMeshComponent found!"));
-		return;
-	}
-
-	const FReferenceSkeleton& RefSkeleton = SkelMesh->GetSkeletalMeshAsset()->GetRefSkeleton();
-	int32 PelvisIdx = RefSkeleton.FindBoneIndex(FName("pelvis"));
-	int32 NeckIdx = RefSkeleton.FindBoneIndex(FName("neck_01"));
-
-	if (PelvisIdx == INDEX_NONE || NeckIdx == INDEX_NONE)
-	{
-		UE_LOG(LogTemp, Error, TEXT("[Kinemotion] Required bones not found!"));
-		return;
-	}
-
-	const TArray<FTransform>& CS = SkelMesh->GetComponentSpaceTransforms();
-	if (CS.Num() == 0)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[Kinemotion] ComponentSpaceTransforms empty! Retrying..."));
-		GetWorld()->GetTimerManager().SetTimerForNextTick([this]() { CalibrateFromSkeleton(); });
-		return;
-	}
-
-	if (!CS.IsValidIndex(PelvisIdx) || !CS.IsValidIndex(NeckIdx))
-	{
-		UE_LOG(LogTemp, Error, TEXT("[Kinemotion] Bone indices invalid!"));
-		return;
-	}
-
-	// Bounding box del skeleton
-	SkeletonBounds = SkelMesh->CalcBounds(FTransform::Identity).GetBox();
-	const FVector BoundsSize = SkeletonBounds.GetSize();
-	SkeletonHeight = BoundsSize.Z;
-
-	// Pelvis en component space
-	FVector PelvisLoc = CS[PelvisIdx].GetLocation();
-	SkeletonRootOffset = PelvisLoc;
-
-	// ✅ NUEVO: Root del suelo = base del bounding box (mismo X/Y que pelvis)
-	const float FloorZ = SkeletonBounds.Min.Z + FloorZOffset;
-	FloorRootLocal = FVector(PelvisLoc.X, PelvisLoc.Y, FloorZ);
-
-	// Calcular escala
-	CalculateEffectiveScale();
-
-	// Limpiar buffer de suavizado
-	PrevFilteredLocal.Empty();
-
-	InitialSkeletonTransform = SkelMesh->GetComponentTransform();
-	bIsCalibrated = true;
-
-	UE_LOG(LogTemp, Warning, TEXT("[Kinemotion] ✓ Calibrated | Height: %.1f | PelvisZ: %.1f | FloorZ: %.1f | Scale: %.1f"),
-		SkeletonHeight, PelvisLoc.Z, FloorRootLocal.Z, EffectiveIsotropicScale);
-}
+// ---------------------------------------------------------------------------------------
+// Filtering
+// ---------------------------------------------------------------------------------------
 
 FVector UKinemotionMocap::ApplySmoothing(EKinemotionPoint PointId, const FVector& NewPos)
 {
-	if (!bEnableSmoothing || SmoothingAlpha <= 0.01f)
+	const int32 PointIndex = static_cast<int32>(PointId);
+	if (!PrevFilteredLocal.IsValidIndex(PointIndex))
 	{
-		PrevFilteredLocal.Add(PointId, NewPos);
 		return NewPos;
 	}
 
-	// Obtener posición anterior
-	FVector* PrevPtr = PrevFilteredLocal.Find(PointId);
-	if (!PrevPtr)
+	const auto Accept = [this, PointIndex](const FVector& Value) -> FVector
 	{
-		// Primera vez: guardar y retornar sin filtrar
-		PrevFilteredLocal.Add(PointId, NewPos);
-		return NewPos;
+		PrevFilteredLocal[PointIndex] = Value;
+		bHasFilteredSample[PointIndex] = true;
+		return Value;
+	};
+
+	if (!bEnableSmoothing || SmoothingAlpha <= MinEffectiveSmoothingAlpha)
+	{
+		return Accept(NewPos);
 	}
 
-	FVector Prev = *PrevPtr;
-	FVector Delta = NewPos - Prev;
-	float DeltaMag = Delta.Size();
-
-	// 1. Deadzone: ignorar micro-movimientos
-	if (DeltaMag < DeadzoneCM)
+	// Nothing to smooth against on the first sample for this point.
+	if (!bHasFilteredSample[PointIndex])
 	{
-		return Prev; // No actualizar
+		return Accept(NewPos);
 	}
 
-	// 2. Clamp: limitar saltos bruscos
-	if (DeltaMag > MaxStepCM)
+	const FVector Previous = PrevFilteredLocal[PointIndex];
+	FVector Delta = NewPos - Previous;
+	const float DeltaSize = Delta.Size();
+
+	// Deadzone: hold position through detection noise rather than shivering in place.
+	if (DeltaSize < DeadzoneCM)
+	{
+		return Previous;
+	}
+
+	// Step clamp: a misdetection should drag the point, not teleport it.
+	if (DeltaSize > MaxStepCM)
 	{
 		Delta = Delta.GetSafeNormal() * MaxStepCM;
 	}
 
-	// 3. EMA (Exponential Moving Average)
-	FVector Filtered = Prev + Delta * (1.0f - SmoothingAlpha);
-
-	// Guardar para siguiente frame
-	PrevFilteredLocal.Add(PointId, Filtered);
-	return Filtered;
+	return Accept(Previous + Delta * (1.0f - SmoothingAlpha));
 }
 
-void UKinemotionMocap::CalculateEffectiveScale()
+// ---------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------
+
+USkeletalMeshComponent* UKinemotionMocap::FindSkeletalMesh() const
 {
-	// Base = altura del skeleton o tamaño fijo, según el modo elegido
-	const float BaseRef = bScaleRelativeToSkeleton ? SkeletonHeight : ReferenceSizeCM;
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return nullptr;
+	}
 
-	// Escala isotrópica: un único valor para X, Y, Z
-	EffectiveIsotropicScale = FMath::Max(1.0f, BaseRef) * FMath::Max(0.1f, StickmanScale);
+	USkeletalMeshComponent* SkelMesh = Owner->FindComponentByClass<USkeletalMeshComponent>();
+
+	// Logged once rather than every frame: this runs inside the capture path.
+	if (!SkelMesh && !bLoggedMissingSkeletalMesh)
+	{
+		bLoggedMissingSkeletalMesh = true;
+		UE_LOG(LogKinemotion, Error,
+			TEXT("%s has no USkeletalMeshComponent; Kinemotion has nothing to drive."), *Owner->GetName());
+	}
+
+	return SkelMesh;
 }
 
-FVector UKinemotionMocap::ProjectToSkeletonSpace(const FVector& NormalizedPoint)
+#if ENABLE_DRAW_DEBUG
+void UKinemotionMocap::DrawDebugPose(const UWorld& World) const
 {
-	// NormalizedPoint está en rango [0, 1] en X, Y, Z
-	// Lo proyectamos al bounding box del skeleton
+	for (const TPair<EKinemotionPoint, FVector>& Point : CachedWorldPoints)
+	{
+		DrawDebugSphere(&World, Point.Value, DebugPointRadius, DebugSphereSegments,
+			FColor::Red, false, DebugDrawLifetime, SDPG_World, DebugBoneThickness);
+	}
 
-	FVector ProjectedLocal;
+	// Bones come from the same rig table that drives the published skeleton, so the debug
+	// view cannot disagree with what is actually being sent.
+	for (int32 BoneIndex = FirstDrivenBoneIndex; BoneIndex < KinemotionBoneCount; ++BoneIndex)
+	{
+		const FKinemotionBoneDef& Bone = KinemotionRig[BoneIndex];
+		const FVector* Start = CachedWorldPoints.Find(Bone.ReferencePoint);
+		const FVector* End = CachedWorldPoints.Find(Bone.Point);
 
-	// X (Profundidad): Mapear de [0,1] a [-Depth/2, +Depth/2]
-	ProjectedLocal.X = (NormalizedPoint.X - 0.5f) * SkeletonDepth;
-
-	// Y (Ancho): Mapear de [0,1] a [-Width/2, +Width/2]
-	ProjectedLocal.Y = (NormalizedPoint.Y - 0.5f) * SkeletonWidth;
-
-	// Z (Altura): Mapear de [0,1] a [0, Height] (desde pies hacia cabeza)
-	ProjectedLocal.Z = NormalizedPoint.Z * SkeletonHeight;
-
-	return ProjectedLocal;
+		if (Start && End)
+		{
+			DrawDebugLine(&World, *Start, *End, FColor::Green, false,
+				DebugDrawLifetime, SDPG_World, DebugBoneThickness);
+		}
+	}
 }
+#endif
