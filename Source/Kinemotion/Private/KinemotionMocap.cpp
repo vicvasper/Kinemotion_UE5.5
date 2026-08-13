@@ -103,7 +103,7 @@ namespace
 		{ EKinemotionPoint::RightAnkle,     KinemotionKeypoint::RightAnkle    },
 	};
 
-	// -- Class defaults -------------------------------------------------------------------
+	// Class defaults
 
 	const TCHAR* const DefaultSubjectName = TEXT("KinemotionWebcam");
 	const TCHAR* const DefaultPoseModelPath = TEXT("/Kinemotion/NeuralNetworks/pose_landmark_full.pose_landmark_full");
@@ -125,7 +125,7 @@ namespace
 	/** Just over one frame at 60 Hz: long enough to stay visible, short enough not to pile up. */
 	constexpr float DefaultDebugDrawLifetime = 0.05f;
 
-	// -- Implementation constants ---------------------------------------------------------
+	// Implementation constants
 
 	/** Below this the smoothing filter is a no-op, so it is bypassed rather than run. */
 	constexpr float MinEffectiveSmoothingAlpha = 0.01f;
@@ -247,9 +247,7 @@ void UKinemotionMocap::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 	}
 }
 
-// ---------------------------------------------------------------------------------------
 // Live Link
-// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::SetupLiveLinkDirect()
 {
@@ -318,9 +316,7 @@ void UKinemotionMocap::ShutdownLiveLink()
 	bLiveLinkRegistered = false;
 }
 
-// ---------------------------------------------------------------------------------------
 // Setup
-// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::InitNNE()
 {
@@ -400,9 +396,7 @@ void UKinemotionMocap::InitMedia()
 	UE_LOG(LogKinemotion, Log, TEXT("Opened capture device %d of %d."), CameraIndex, Devices.Num());
 }
 
-// ---------------------------------------------------------------------------------------
 // Calibration
-// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::Recalibrate()
 {
@@ -501,9 +495,7 @@ void UKinemotionMocap::CalculateEffectiveScale()
 	EffectiveIsotropicScale = FMath::Max(1.0f, ReferenceLength) * FMath::Max(0.1f, StickmanScale);
 }
 
-// ---------------------------------------------------------------------------------------
 // Frame acquisition
-// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::RequestTextureRead()
 {
@@ -672,9 +664,7 @@ void UKinemotionMocap::RunInference()
 	}
 }
 
-// ---------------------------------------------------------------------------------------
 // Decode and publish
-// ---------------------------------------------------------------------------------------
 
 void UKinemotionMocap::DecodeAndPublish()
 {
@@ -695,7 +685,7 @@ void UKinemotionMocap::DecodeAndPublish()
 		bPelvisInitialized = true;
 	}
 
-	// -- Decode ------------------------------------------------------------------------
+	// Decode
 
 	const auto DecodeKeypoint = [this](int32 ModelIndex) -> FVector
 	{
@@ -721,7 +711,7 @@ void UKinemotionMocap::DecodeAndPublish()
 		RawPose[static_cast<int32>(Mapping.Point)] = DecodeKeypoint(Mapping.ModelIndex);
 	}
 
-	// -- Derive the points the model does not predict -----------------------------------
+	// Derive the points the model does not predict
 
 	const FVector LeftHip = RawPose[static_cast<int32>(EKinemotionPoint::LeftHip)];
 	const FVector RightHip = RawPose[static_cast<int32>(EKinemotionPoint::RightHip)];
@@ -737,7 +727,7 @@ void UKinemotionMocap::DecodeAndPublish()
 	RawPose[static_cast<int32>(EKinemotionPoint::LeftClavicle)] = FMath::Lerp(NeckBase, LeftShoulder, ClavicleBlend);
 	RawPose[static_cast<int32>(EKinemotionPoint::RightClavicle)] = FMath::Lerp(NeckBase, RightShoulder, ClavicleBlend);
 
-	// -- Into component space -----------------------------------------------------------
+	// Into component space
 
 	// Centring, scaling, axis correction, the root offset and smoothing used to be five
 	// sequential passes over eighteen individually named locals. One pass, one array.
@@ -751,7 +741,7 @@ void UKinemotionMocap::DecodeAndPublish()
 		PoseLocal[PointIndex] = ApplySmoothing(static_cast<EKinemotionPoint>(PointIndex), Oriented);
 	}
 
-	// -- Into world space, for consumers ------------------------------------------------
+	// Into world space, for consumers
 
 	const FTransform ComponentTransform = SkelMesh->GetComponentTransform();
 
@@ -784,7 +774,7 @@ void UKinemotionMocap::DecodeAndPublish()
 	}
 #endif
 
-	// -- Publish ------------------------------------------------------------------------
+	// Publish
 
 	FLiveLinkFrameDataStruct FrameData(FLiveLinkAnimationFrameData::StaticStruct());
 	FLiveLinkAnimationFrameData* AnimData = FrameData.Cast<FLiveLinkAnimationFrameData>();
@@ -827,9 +817,7 @@ TMap<EKinemotionPoint, FVector> UKinemotionMocap::GetDetectedBodyPoints() const
 	return CachedWorldPoints;
 }
 
-// ---------------------------------------------------------------------------------------
 // Filtering
-// ---------------------------------------------------------------------------------------
 
 FVector UKinemotionMocap::ApplySmoothing(EKinemotionPoint PointId, const FVector& NewPos)
 {
@@ -876,9 +864,7 @@ FVector UKinemotionMocap::ApplySmoothing(EKinemotionPoint PointId, const FVector
 	return Accept(Previous + Delta * (1.0f - SmoothingAlpha));
 }
 
-// ---------------------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------------------
 
 USkeletalMeshComponent* UKinemotionMocap::FindSkeletalMesh() const
 {
