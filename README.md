@@ -5,7 +5,7 @@ https://github.com/user-attachments/assets/afc76e2f-0b01-4427-8085-b326c03b9bd0
 
 [![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.x-blue.svg)](https://www.unrealengine.com/)
 [![Module](https://img.shields.io/badge/Plugin-Runtime-informational.svg)](#architecture)
-[![Version](https://img.shields.io/badge/Version-1.0-orange.svg)](https://github.com/vicvasper/Kinemotion_UE5.5-/releases)
+[![Version](https://img.shields.io/badge/Version-1.0-orange.svg)](https://github.com/vicvasper/Kinemotion_UE5.5/releases)
 
 Monocular AI motion capture for Unreal Engine 5.x. Kinemotion ingests webcam video, runs inference with Unreal’s Neural Network Engine (NNE), and streams a 19-bone skeleton through Live Link for retargeting to any `USkeletalMeshComponent` in editor or PIE.
 
@@ -24,7 +24,9 @@ Monocular AI motion capture for Unreal Engine 5.x. Kinemotion ingests webcam vid
 - A project actor with a `USkeletalMeshComponent` that matches the standard mannequin bones (pelvis, spine_01, neck_01, head, clavicle/upperarm/lowerarm/hand, thigh/calf/foot).
 
 ## Installation
-1) Copy `Plugins/Kinemotion` into your project (or clone the repo at the project root).
+1) Download `Kinemotion_UE5.5_v1.0.zip` from the [latest release](https://github.com/vicvasper/Kinemotion_UE5.5/releases/latest) and extract the `Kinemotion` folder into your project's `Plugins/` directory.
+   - The release ZIP is the complete plugin. The repository does not contain the pose models (`Content/NeuralNetworks/pose_landmark_full.uasset` and `Resources/rtmw3d-x.onnx`, about 350 MB each) because they exceed GitHub's file size limit, so a plain clone cannot run inference.
+   - If you work from a clone, copy those two files from the release ZIP into the same paths.
 2) In the editor, open **Edit > Plugins** and enable **Kinemotion** (category: *Other*).
 3) For C++ projects: right-click the `.uproject` → **Generate Visual Studio project files** → build the solution.
 4) Restart the editor.
@@ -88,6 +90,6 @@ Bone order (19): `root`, `pelvis`, `spine_01`, `neck_01`, `head`, `clavicle_l`, 
 Created by Victor Rivas ([@vicvasper](https://github.com/vicvasper)).
 
 ## Links
-- Repository: [github.com/vicvasper/Kinemotion_UE5.5-](https://github.com/vicvasper/Kinemotion_UE5.5-)
+- Repository: [github.com/vicvasper/Kinemotion_UE5.5](https://github.com/vicvasper/Kinemotion_UE5.5)
 - Plugin folder: `Plugins/Kinemotion`
 - Module: `Plugins/Kinemotion/Source/Kinemotion`

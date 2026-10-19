@@ -21,3 +21,8 @@ DDC/
 .DS_Store
 *.xcodeproj
 *.xcworkspace
+
+# Pose models are too large for git (>100 MB) and are shipped in the
+# GitHub release ZIP instead. See "Installation" in README.md.
+Content/NeuralNetworks/pose_landmark_full.uasset
+Resources/rtmw3d-x.onnx
