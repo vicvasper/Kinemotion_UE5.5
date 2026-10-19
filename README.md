@@ -19,14 +19,27 @@ Monocular AI motion capture for Unreal Engine 5.x. Kinemotion ingests webcam vid
 
 ## Requirements
 - Unreal Engine 5.3 or higher (modules: LiveLink, Media/MediaAssets, NNE, RHI/RenderCore).
-- Engine plugins enabled: **LiveLink**, **LiveLinkAnimationCore**, **NNE**.
+- Engine plugins enabled: **LiveLink** and **NNERuntimeORT** (provides the default `NNERuntimeORTDml` runtime). `Kinemotion.uplugin` declares both as dependencies.
 - A webcam recognized by `MediaPlayer` (`CameraIndex` selects the device).
 - A project actor with a `USkeletalMeshComponent` that matches the standard mannequin bones (pelvis, spine_01, neck_01, head, clavicle/upperarm/lowerarm/hand, thigh/calf/foot).
 
+## Getting the plugin
+The binary assets (`Content/**/*.uasset`, `Resources/*.onnx`, `Resources/Icon128.png`) are stored with Git LFS; the source code and `Kinemotion.uplugin` are plain Git. Pick one:
+
+- **Release ZIP (recommended)**: download the archive from the [Releases page](https://github.com/vicvasper/Kinemotion_UE5.5/releases). It contains the full plugin, including `Content/NeuralNetworks/pose_landmark_full.uasset`, and does not touch LFS.
+- **Git clone with LFS**: `git clone` followed by `git lfs pull`. A full checkout downloads roughly 820 MB of LFS objects.
+- **Git clone without LFS**: if LFS downloads fail (for example `This repository exceeded its LFS budget`), clone the code alone and add the assets from the release ZIP:
+  ```bash
+  GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/vicvasper/Kinemotion_UE5.5.git Kinemotion
+  ```
+  Files left as LFS pointers are about 130 bytes; Unreal reports them as corrupt packages, so replace them before opening the project.
+
+The pose model is RTMW3D-x from [MMPose](https://github.com/open-mmlab/mmpose) (288×384 input, 133 whole-body keypoints). If you have the `.onnx` but not the `.uasset`, drag the `.onnx` into `Content/NeuralNetworks/` in the editor, name it `pose_landmark_full`, or point `PoseModel` at wherever you imported it.
+
 ## Installation
-1) Copy `Plugins/Kinemotion` into your project (or clone the repo at the project root).
-2) In the editor, open **Edit > Plugins** and enable **Kinemotion** (category: *Other*).
-3) For C++ projects: right-click the `.uproject` → **Generate Visual Studio project files** → build the solution.
+1) Copy the plugin folder into `YourProject/Plugins/Kinemotion`.
+2) The repository ships no prebuilt binaries, so the module is compiled from `Source/`: right-click the `.uproject` → **Generate Visual Studio project files** → build the solution. A Blueprint-only project needs one C++ class added first so it can build plugins.
+3) In the editor, open **Edit > Plugins** and enable **Kinemotion** (category: *Other*). Live Link and NNERuntimeORT are enabled with it as dependencies.
 4) Restart the editor.
 
 ## Quick start
@@ -70,7 +83,7 @@ Monocular AI motion capture for Unreal Engine 5.x. Kinemotion ingests webcam vid
 
 ## Troubleshooting
 - **Live Link source not visible**: ensure Live Link plugins are enabled; `StartupModule` loads them. Check `SubjectName` collisions.
-- **NNE model not loading**: confirm plugin content is enabled and that `PoseModel` points at a valid `UNNEModelData` asset. To use a different runtime, set `NneRuntimeName` in the details panel; no code change is needed.
+- **NNE model not loading**: if the log mentions a corrupt or unreadable package, the `.uasset` is still an LFS pointer; see [Getting the plugin](#getting-the-plugin). Otherwise confirm plugin content is enabled and that `PoseModel` points at a valid `UNNEModelData` asset. To use a different runtime, set `NneRuntimeName` in the details panel; no code change is needed.
 - **Webcam not opening**: verify `CameraIndex` and that the device appears in `MediaBlueprintFunctionLibrary::EnumerateVideoCaptureDevices`.
 - **Jitter or spikes**: raise `SmoothingAlpha`, tune `DeadzoneCM` / `MaxStepCM`, or lock pelvis (`bPelvisFree = false`).
 - **Incorrect height/scale**: call `Recalibrate()`, then adjust `StickmanScale`, `ReferenceSizeCM` or `FloorZOffset`.

@@ -1,3 +1,34 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:155ef93c84d1de12d40569ee15d540b1f4d93fd834f16a1c59bdf77c59719f3f
-size 470
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Kinemotion",
+	"Description": "Monocular AI motion capture: webcam pose estimation with NNE, streamed through Live Link.",
+	"Category": "Other",
+	"CreatedBy": "Victor Rivas",
+	"CreatedByURL": "https://github.com/vicvasper",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/vicvasper/Kinemotion_UE5.5/issues",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "Kinemotion",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "LiveLink",
+			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeORT",
+			"Enabled": true
+		}
+	]
+}
